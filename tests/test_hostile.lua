@@ -69,6 +69,21 @@ do
   sent = commands[#commands].command
   T.check(sent:find('shiftToGearIndex%(1%)') and sent:find('ai.setMode%("chase"%)'), 'back into drive for the chase AI')
   T.check(sent:find('input.event%("brake", 0, 2%)'), 'inputs released for the AI')
+  -- The EMP on the player's car: stalls it, locks its brakes and shoves it away from the hostile.
+  local before = #commands
+  T.check(h:emp(8, 'start'), 'EMP sent')
+  sent = commands[#commands].command
+  T.eq(commands[#commands].id, 7, 'on the player car'); T.eq(#commands, before + 1, 'in one command')
+  T.check(sent:find('setIgnitionLevel%(0%)'), 'ignition cut'); T.check(sent:find('input.event%("brake", 1, 1%)'), 'brakes locked')
+  T.check(sent:find('toggle_warn_signal'), 'hazards on'); T.check(sent:find('emp.wav', 1, true), 'EMP sound')
+  T.check(sent:find('applyVelocity%(vec3%(%-3.0000, %-4.0000, 0.0000%)%)'), 'shoved 5 m/s straight away from the hostile')
+  T.check(sent:find('setPlanets%({1003.0000, 2004.0000, 50.0000, 5,'), 'repelled from the hostile')
+  T.check(not sent:find('breakDevice'), 'nothing broken for good')
+  T.check(h:emp(8, 'shock_over'), 'shove ended'); T.check(commands[#commands].command:find('setPlanets%({}%)'), 'repulsion cleared')
+  T.check(h:emp(8, 'over'), 'car given back')
+  sent = commands[#commands].command
+  T.check(sent:find('input.event%("brake", 0, 1%)'), 'brakes released'); T.check(sent:find('setIgnitionLevel%(s.ignition or 2%)'), 'ignition back on')
+  T.eq(select(2, hostile.new({ player = function() return nil end }):emp(8, 'start')), 'vehicle_required', 'EMP needs a player car')
   T.check(h:remove(8), 'removed'); T.eq(deleted[1], 8, 'deleted from the world')
   local _, why = h:status(8)
   T.eq(why, 'vehicle_gone', 'gone once removed'); T.check(h:remove(8), 'removing twice is harmless')
@@ -152,6 +167,61 @@ do
   brain = {}
   run(brain, { speed = 10, damage = 0, distance = 50 }, 0.5); run(brain, { speed = 10, damage = 900, distance = 50 }, 0.1)
   T.eq(brain.mode, 'chase', 'damage far from the player does not back it off')
+end
+
+-- The EMP and the robbery, in the brain.
+do
+  local B, E = hostile.BRAIN, hostile.EMP
+  T.eq(E.METRES, 18, 'EMP within 18 m'); T.eq(E.SECONDS, 6, 'stalls the player for 6 s'); T.eq(E.ESCAPE_METRES, 250, 'escapes at 250 m')
+  T.eq(hostile.robAmount(10000), 2500, 'takes a quarter'); T.eq(hostile.robAmount(100000), 5000, 'at most $5,000')
+  T.eq(hostile.robAmount(3), 0, 'whole dollars'); T.eq(hostile.robAmount(0), 0, 'nothing from nothing'); T.eq(hostile.robAmount(-5), 0, 'or from debt')
+  local function run(brain, reading, seconds)
+    local orders = {}
+    for _ = 1, math.floor(seconds * 10 + 0.5) do
+      local order = hostile.think(brain, reading, 0.1)
+      if order then orders[#orders + 1] = order end
+    end
+    return orders
+  end
+  -- Not before it has rammed the player.
+  local brain = {}
+  run(brain, { speed = 10, damage = 0, distance = 10, angle = 0 }, 0.5)
+  T.check(not hostile.empReady(brain, { distance = 10 }), 'not before a hit')
+  run(brain, { speed = 10, damage = 500, distance = 5, angle = 0 }, 0.1)
+  T.eq(brain.hits, 1, 'a hit counted'); T.check(not hostile.empReady(brain, { distance = 5 }), 'not while backing off')
+  run(brain, { speed = 3, damage = 500, distance = 15, angle = 0 }, B.BACKOFF_SECONDS + 0.1)
+  T.check(hostile.empReady(brain, { distance = 15 }), 'ready after ramming, inside 18 m')
+  T.check(not hostile.empReady(brain, { distance = 25 }), 'not from further off')
+  -- Or after chasing long enough without landing a hit.
+  local slow = {}
+  run(slow, { speed = 10, damage = 0, distance = 60, angle = 0 }, E.AFTER_SECONDS - 1)
+  T.check(not hostile.empReady(slow, { distance = 10 }), 'not yet without a hit')
+  run(slow, { speed = 10, damage = 0, distance = 60, angle = 0 }, 1.1)
+  T.check(hostile.empReady(slow, { distance = 10 }), 'ready after 30 s of chasing')
+  -- Fired: pulls up, then flees, never firing again.
+  T.eq(hostile.rob(brain, true).kind, 'rest', 'pulls up'); T.eq(brain.mode, 'rob', 'robbing')
+  T.check(not hostile.counts(brain), 'pulled up is not disabled'); T.check(not hostile.empReady(brain, { distance = 5 }), 'only once')
+  T.eq(#run(brain, { speed = 0, damage = 500, distance = 5, angle = 0 }, E.ROB_SECONDS - 0.2), 0, 'stays put while robbing')
+  local orders = run(brain, { speed = 0, damage = 500, distance = 5, angle = 0 }, 0.3)
+  T.eq(brain.mode, 'flee', 'then flees'); T.eq(orders[1].gear, 1, 'forwards')
+  T.eq(orders[1].throttle, B.TURN_THROTTLE, 'slowly while turning away from a player ahead')
+  orders = run(brain, { speed = 10, damage = 500, distance = 40, angle = 150 }, 0.2)
+  T.near(orders[#orders].steer, 30 / B.STEER_FULL_DEGREES * B.STEER_SIGN, 1e-9, 'steers to put the player straight behind')
+  T.eq(orders[#orders].throttle, E.FLEE_THROTTLE, 'at speed with the player behind')
+  orders = run(brain, { speed = 25, damage = 500, distance = 40, angle = 180 }, 0.2)
+  T.eq(orders[#orders].throttle, 0, 'lifts off above 70 km/h so it can be caught'); T.eq(orders[#orders].steer, 0, 'straight on')
+  -- Rammed while fleeing it carries on fleeing; pinned, it reverses out and flees again.
+  run(brain, { speed = 10, damage = 500, distance = 5, angle = 180 }, 0.1); run(brain, { speed = 10, damage = 1200, distance = 5, angle = 180 }, 0.1)
+  T.eq(brain.mode, 'flee', 'a hit does not turn it round')
+  run(brain, { speed = 0, damage = 1200, distance = 4, angle = 180 }, B.STUCK_SECONDS + 0.1)
+  T.eq(brain.mode, 'unstick', 'stuck fleeing: reverses out')
+  run(brain, { speed = 0, damage = 1200, distance = 4, angle = 180 }, B.UNSTICK_SECONDS + 0.1)
+  T.eq(brain.mode, 'flee', 'and flees again')
+  -- With nothing taken it goes back to ramming.
+  local broke = { mode = 'chase' }
+  hostile.rob(broke, false)
+  run(broke, { speed = 0, damage = 0, distance = 5, angle = 0 }, E.ROB_SECONDS + 0.1)
+  T.eq(broke.mode, 'chase', 'nothing taken: back to the chase')
 end
 
 -- The run, with a hostile set to come 4 km in.
@@ -316,6 +386,92 @@ do
   end
   T.eq(#h.spawns, 3, 'only twice'); T.eq(h:current(), nil, 'then removed')
   T.eq(c:view().carkov.hostile, nil, 'HUD clear'); T.eq(c:view().carkov.flash.title, 'HOSTILE LOST', 'HUD says it is gone')
+end
+
+-- Up to the EMP: out, rammed the player, then close in.
+local function toEmp()
+  local c, a, h = onRun()
+  drive(c, a, 4050); F.advance(c, 5.1)
+  local id = h:current()
+  h.alive[id] = { speed = 10, damage = 0, distance = 30, angle = 0, grounded = true }; F.advance(c, 0.5)
+  h.alive[id] = { speed = 10, damage = 500, distance = 5, angle = 0, grounded = true }; c:tick(0.1)
+  T.eq(c.hostile.brain.mode, 'backoff', 'rammed the player'); T.eq(#h.emps, 0, 'no EMP while backing off')
+  h.alive[id] = { speed = 3, damage = 500, distance = 30, angle = 0, grounded = true }; F.advance(c, hostile.BRAIN.BACKOFF_SECONDS + 0.2)
+  return c, a, h, id
+end
+
+-- The EMP: stalls the player for 6 s, robs them, then the hostile flees and escapes 250 m off.
+do
+  local c, a, h, id = toEmp()
+  local balance = c:view().balance
+  T.check(balance > 0, 'money to take')
+  h.alive[id].distance = 15; c:tick(0.1)
+  local v = c:view()
+  local taken = math.floor(math.min(balance * 0.25, 5000))
+  T.eq(h.emps[1], 'start', 'EMP fired inside 18 m'); T.eq(v.balance, balance - taken, 'a quarter of the money taken')
+  T.eq(v.carkov.hostile.phase, 'emp', 'HUD shows the EMP'); T.eq(v.carkov.hostile.stolen, taken, 'and what was taken')
+  T.eq(v.carkov.hostile.empSeconds, 6, 'stalled for 6 s'); T.eq(h.orders[#h.orders].kind, 'rest', 'the hostile pulls up')
+  F.advance(c, 0.6)
+  T.eq(h.emps[2], 'shock_over', 'the shove ends after 0.5 s')
+  F.advance(c, 3.5)
+  T.eq(c.hostile.brain.mode, 'flee', 'flees after 4 s'); T.eq(h.orders[#h.orders].kind, 'drive', 'steered away from here')
+  T.eq(#h.emps, 2, 'player still stalled')
+  -- Paused, the stall waits too.
+  c.paused = function() return true end; F.advance(c, 5); c.paused = function() return false end
+  T.eq(#h.emps, 2, 'the EMP does not run out while paused')
+  F.advance(c, 2)
+  T.eq(h.emps[3], 'over', 'the player gets their car back after 6 s'); T.eq(#h.emps, 3, 'once')
+  v = c:view()
+  T.eq(v.carkov.hostile.phase, 'fleeing', 'HUD shows it fleeing'); T.eq(v.carkov.hostile.escapeMetres, 250, 'and where it escapes')
+  h.alive[id].distance = 240; c:tick(0.1)
+  T.check(c.hostile ~= nil, 'not escaped at 240 m')
+  h.alive[id].distance = 260; c:tick(0.1)
+  v = c:view()
+  T.eq(h.removed[#h.removed], id, 'removed before it can fall through the world'); T.eq(v.carkov.hostile, nil, 'gone')
+  T.eq(v.carkov.flash.title, 'HOSTILE ESCAPED', 'HUD says so'); T.check(v.carkov.flash.text:find(tostring(taken % 1000), 1, true), 'with the amount')
+  T.eq(v.balance, balance - taken, 'the money is gone')
+end
+
+-- Disabled while fleeing: the bounty and the money back; falling through the world is an escape.
+do
+  local c, a, h, id = toEmp()
+  local balance = c:view().balance
+  h.alive[id].distance = 15; c:tick(0.1)
+  local taken = balance - c:view().balance
+  F.advance(c, 4.2)
+  T.eq(c.hostile.brain.mode, 'flee', 'fleeing')
+  h.alive[id] = { speed = 0, damage = 4000, distance = 40, angle = 180, grounded = true }
+  F.advance(c, hostile.BRAIN.STUCK_SECONDS + hostile.BRAIN.UNSTICK_SECONDS + hostile.BRAIN.STUCK_SECONDS + 0.3)
+  T.eq(c.hostile.brain.mode, 'beaten', 'damaged and stuck, it gives up')
+  F.advance(c, hostile.STILL_SECONDS + 0.2)
+  T.eq(c:view().carkov.hostile.phase, 'disabled', 'disabled'); T.eq(c:view().carkov.hostile.stolen, taken, 'still holding the money')
+  h.alive[id].distance = 9; c:tick(0.1)
+  local v = c:view()
+  T.eq(v.balance, balance - taken + 5000 + taken, 'bounty and money back'); T.check(v.carkov.flash.text:find('got back', 1, true), 'HUD says so')
+  c, a, h, id = toEmp()
+  h.alive[id].distance = 15; c:tick(0.1)
+  F.advance(c, 4.2)
+  local spawns = #h.spawns
+  h.alive[id].grounded = false; F.advance(c, hostile.FALL_SECONDS + 0.2)
+  T.eq(c:view().carkov.flash.title, 'HOSTILE ESCAPED', 'fell through fleeing: escaped'); T.eq(#h.spawns, spawns, 'not respawned')
+  T.eq(h.emps[#h.emps], 'over', 'the player is never left stalled')
+end
+
+-- Quitting mid-EMP gives the car back; with no money to take it carries on ramming.
+do
+  local c, a, h, id = toEmp()
+  h.alive[id].distance = 15; c:tick(0.1)
+  c.quitArmed = true; T.check(c:quitCarKov(), 'quit mid-EMP')
+  T.eq(h.emps[#h.emps], 'over', 'car given back when the run ends')
+  c, a, h, id = toEmp()
+  c.profile.progression.balance = 0
+  h.alive[id].distance = 15; c:tick(0.1)
+  T.eq(h.emps[1], 'start', 'still fires'); T.eq(c:view().carkov.hostile.stolen, nil, 'nothing taken')
+  F.advance(c, 4.2)
+  T.check(c.hostile.brain.mode ~= 'flee', 'nothing to run off with: rams again'); T.eq(c:view().carkov.hostile.phase, 'emp', 'player still stalled')
+  F.advance(c, 2); T.eq(c:view().carkov.hostile.phase, 'chasing', 'then the chase as before')
+  h.alive[id].distance = 5; F.advance(c, 1)
+  T.eq(#h.emps, 3, 'only one EMP an encounter')
 end
 
 -- No hostile spawner (or off a run), nothing happens.

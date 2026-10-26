@@ -59,7 +59,7 @@ angular.module('beamng.apps').directive('beamngEarthEnduroHud', [function () {
         if (scope.tab === 'stages' && onCarKov(next)) scope.tab = 'carkov'
       }
       // The one message under the clock: the most urgent of out of money and can't drive, extraction complete, a
-      // hostile inbound, a puncture just now, a roadside event just now, how a CarKov run just ended or its hostile was dealt
+      // hostile inbound or its EMP, a puncture just now, a roadside event just now, how a CarKov run just ended or its hostile was dealt
       // with, the extraction countdown, a hostile on the player's tail, stage complete, a sponsor bonus just paid, a perk just
       // used or lost, a friendly village's offer, a perk on offer, then the status.
       var notices = {
@@ -86,6 +86,10 @@ angular.module('beamng.apps').directive('beamngEarthEnduroHud', [function () {
           hostileNotice.title = '\u26A0 HOSTILE INBOUND ' + threat.seconds
           return hostileNotice
         }
+        if (threat && threat.phase === 'emp') {
+          hostileNotice.title = '\u26A1 EMP! ENGINE DEAD ' + threat.empSeconds
+          return hostileNotice
+        }
         if (d.puncture && d.puncture.flash) return punctureNotice
         if (d.road && d.road.flash) {
           roadNotice.title = d.road.flash.title
@@ -102,7 +106,9 @@ angular.module('beamng.apps').directive('beamngEarthEnduroHud', [function () {
           return holdNotice
         }
         if (threat) {
-          hostileNotice.title = threat.phase === 'disabled' ? 'HOSTILE DISABLED: CLAIM IT' : 'HOSTILE ON YOUR TAIL'
+          hostileNotice.title = threat.phase === 'disabled' ? 'HOSTILE DISABLED: CLAIM IT'
+            : threat.phase === 'fleeing' ? 'ROBBED $' + String(Math.floor(threat.stolen || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ': CATCH IT'
+            : 'HOSTILE ON YOUR TAIL'
           return hostileNotice
         }
         if (d.stageFinished) return notices.done

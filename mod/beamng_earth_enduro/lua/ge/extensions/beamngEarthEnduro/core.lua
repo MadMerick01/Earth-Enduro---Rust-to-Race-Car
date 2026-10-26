@@ -1409,6 +1409,7 @@ function M.new(deps)
     stranded = { title = 'CARKOV FAILED', text = 'You were out of money and could not drive, so the run is over and the entry fee is lost.' },
     hostile_disabled = { title = 'HOSTILE DISABLED', text = 'You took out the hostile and earned ' .. dollars(hostile.REWARD) .. '. Save to keep it.' },
     hostile_lost = { title = 'HOSTILE LOST', text = 'You left the hostile far behind. It is gone.' },
+    hostile_escaped = { title = 'HOSTILE ESCAPED', text = 'The hostile got away' },
     hostile_fell = { title = 'HOSTILE LOST', text = 'The hostile fell out of the world. It is gone.' },
   }
   function c:flashCarKov(result, extra)
@@ -1456,11 +1457,14 @@ function M.new(deps)
   -- not within SAFE_EXTRACTION_METRES of the extraction), HOSTILE INBOUND counts down, then a
   -- hostile car is spawned ahead of the player, facing them, and comes at them. Once it has stood still for
   -- STILL_SECONDS with real damage, getting within CLAIM_METRES of it pays the bounty. Like
-  -- driving pay, the bounty and the hostile having come are kept by Save.
+  -- driving pay, the bounty and the hostile having come are kept by Save. Close in, it can fire an
+  -- EMP, rob the player and flee (hostile.lua's EMP); disabling it then gives the money back too.
   function c:clearHostile(reason)
     local encounter = self.hostile
     self.hostile = nil
     if not encounter or not encounter.id or not self.hostiles then return end
+    -- The player's car is never left stalled.
+    if encounter.emp then self.hostiles:emp(encounter.id, 'over') end
     local ok, why = self.hostiles:remove(encounter.id)
     self.diag:event('hostile_removed', reason .. (ok and '' or (':' .. tostring(why))), ok and 'I' or 'W')
   end
@@ -1479,9 +1483,11 @@ function M.new(deps)
       self:clearHostile('no_run')
       return
     end
-    if self.state ~= 'READY' or not self.arrived or self.paused() then return end
+    if self.paused() then return end
     local step = math.min(dt, MAX_CLOCK_STEP)
     local encounter = self.hostile
+    if encounter and encounter.emp then self:tickEmp(encounter, step) end
+    if self.state ~= 'READY' or not self.arrived then return end
     if not encounter then
       if run.hostileDone or not run.hostileAtKm or self.profile.progression.totalDistanceKm < run.hostileAtKm then return end
       run.hostileDone = true
@@ -1515,7 +1521,8 @@ function M.new(deps)
         self.diag:event('hostile_spawn_failed', tostring(why) .. (detail and (': ' .. detail) or ''), 'E')
         return
       end
-      self.hostile = { phase = 'chasing', id = id, still = 0, brain = {}, airborne = 0, respawns = encounter.respawns or 0 }
+      self.hostile = { phase = 'chasing', id = id, still = 0, brain = { empFired = encounter.empDone }, airborne = 0,
+        respawns = encounter.respawns or 0 }
       self.diag:event('hostile_spawned', tostring(model) .. ' #' .. tostring(id))
       return
     end
@@ -1529,7 +1536,14 @@ function M.new(deps)
     end
     encounter.damage, encounter.distance = status.damage, status.distance
     -- Fallen through the world (no ground under it): respawned ahead of the player, a few times a run.
+    -- Fleeing with the player's money, it has got away with it instead.
     encounter.airborne = status.grounded == false and encounter.airborne + step or 0
+    local fleeing = encounter.brain.fleeing and not encounter.disabled
+    if fleeing and (encounter.airborne >= hostile.FALL_SECONDS
+        or (status.distance and status.distance > hostile.EMP.ESCAPE_METRES)) then
+      self:hostileEscaped(encounter.airborne >= hostile.FALL_SECONDS and 'fell' or 'far')
+      return
+    end
     if encounter.airborne >= hostile.FALL_SECONDS then
       local respawns = encounter.respawns + 1
       self:clearHostile('fell')
@@ -1537,7 +1551,7 @@ function M.new(deps)
         self:flashCarKov('hostile_fell')
         return
       end
-      self.hostile = { phase = 'inbound', left = 1, respawns = respawns }
+      self.hostile = { phase = 'inbound', left = 1, respawns = respawns, empDone = encounter.brain.empFired }
       self.diag:event('hostile_respawn', tostring(respawns), 'W')
       return
     end
@@ -1546,19 +1560,60 @@ function M.new(deps)
     local mode = encounter.brain.mode
     local command = hostile.think(encounter.brain, status, step)
     if command then self.hostiles:drive(encounter.id, command) end
+    if self.hostiles.emp and hostile.empReady(encounter.brain, status) then self:fireEmp(encounter) end
     if encounter.brain.mode ~= mode then self.diag:event('hostile_mode', tostring(encounter.brain.mode)) end
     -- Standing still while reversing out or backing off is trying, not disabled.
     encounter.still = status.speed <= hostile.STILL_SPEED and hostile.counts(encounter.brain) and encounter.still + step or 0
     encounter.disabled = encounter.still >= hostile.STILL_SECONDS and status.damage >= hostile.DISABLED_DAMAGE
     if encounter.disabled and status.distance and status.distance <= hostile.CLAIM_METRES then
-      self:addMoney(hostile.REWARD)
+      local stolen = encounter.stolen or 0
+      self:addMoney(hostile.REWARD + stolen)
       self:clearHostile('disabled')
-      self:flashCarKov('hostile_disabled')
+      self:flashCarKov('hostile_disabled', stolen > 0 and (' You also got back the ' .. dollars(stolen) .. ' it took.') or nil)
       self.diag:event('hostile_bounty', string.format('%.0f damage', status.damage))
     elseif status.distance and status.distance > hostile.LOST_METRES then
       self:clearHostile('lost')
       self:flashCarKov('hostile_lost')
     end
+  end
+
+  -- The EMP fires at the player's car: it takes ROB_SHARE of their money (at most ROB_MAX) and the
+  -- hostile pulls up, then flees with it. With nothing to take it goes back to ramming.
+  function c:fireEmp(encounter)
+    local progression = self.profile.progression
+    local taken = math.min(hostile.robAmount(progression.balance), progression.balance)
+    progression.balance = progression.balance - taken
+    encounter.stolen = taken
+    encounter.emp = { left = hostile.EMP.SECONDS, shock = hostile.EMP.SHOCK_SECONDS }
+    local ok, why = self.hostiles:emp(encounter.id, 'start')
+    self.hostiles:drive(encounter.id, hostile.rob(encounter.brain, taken > 0))
+    self.diag:event('hostile_emp', tostring(taken) .. (ok and '' or (':' .. tostring(why))), ok and 'I' or 'W')
+  end
+
+  -- Counts the EMP down on game time: the shove ends after SHOCK_SECONDS, the car comes back after SECONDS.
+  function c:tickEmp(encounter, step)
+    local emp = encounter.emp
+    if emp.shock then
+      emp.shock = emp.shock - step
+      if emp.shock <= 0 then
+        emp.shock = nil
+        self.hostiles:emp(encounter.id, 'shock_over')
+      end
+    end
+    emp.left = emp.left - step
+    if emp.left <= 0 then
+      encounter.emp = nil
+      self.hostiles:emp(encounter.id, 'over')
+    end
+  end
+
+  -- The hostile got away with the player's money: far enough off that BeamNG.Earth has no ground
+  -- for it, or already through the world. The money is gone.
+  function c:hostileEscaped(how)
+    local stolen = self.hostile.stolen or 0
+    self:clearHostile('escaped')
+    self:flashCarKov('hostile_escaped', ' with ' .. dollars(stolen) .. ' of your money.')
+    self.diag:event('hostile_escaped', how .. ' ' .. tostring(stolen))
   end
 
   -- What the HUD shows of the hostile, or nil when there is none.
@@ -1569,9 +1624,14 @@ function M.new(deps)
       return { phase = 'inbound', seconds = math.max(0, math.ceil(encounter.left)), reward = hostile.REWARD,
         claimMetres = hostile.CLAIM_METRES }
     end
-    return { phase = encounter.disabled and 'disabled' or 'chasing', reward = hostile.REWARD,
+    local phase = encounter.disabled and 'disabled' or encounter.emp and 'emp'
+      or encounter.brain.fleeing and 'fleeing' or 'chasing'
+    return { phase = phase, reward = hostile.REWARD,
       distanceMetres = encounter.distance and math.floor(encounter.distance + 0.5) or nil,
-      claimMetres = hostile.CLAIM_METRES, stillSeconds = hostile.STILL_SECONDS }
+      claimMetres = hostile.CLAIM_METRES, stillSeconds = hostile.STILL_SECONDS,
+      stolen = encounter.stolen and encounter.stolen > 0 and encounter.stolen or nil,
+      empSeconds = encounter.emp and math.max(0, math.ceil(encounter.emp.left)) or nil,
+      escapeMetres = encounter.brain.fleeing and hostile.EMP.ESCAPE_METRES or nil }
   end
 
   -- Quits the run; a second press confirms. Out of money and unable to drive, the car is repaired as far as the money goes.

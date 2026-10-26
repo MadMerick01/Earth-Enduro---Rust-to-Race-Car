@@ -100,7 +100,7 @@ function F.garage()
   end
   return g
 end
--- Stand-in for the hostile spawner: records spawns and removals; tests set each hostile's reading.
+-- Stand-in for the hostile spawner: records spawns, removals and EMP stages; tests set each hostile's reading.
 function F.hostiles()
   local h = { spawns = {}, removed = {}, chases = 0, alive = {}, nextId = 100 }
   function h:spawn(model, config, ahead, side)
@@ -117,6 +117,11 @@ function F.hostiles()
     return self.alive[id] ~= nil
   end
   function h:chase(id) self.chases = self.chases + 1; return self.alive[id] ~= nil end
+  h.emps = {}
+  function h:emp(id, stage)
+    self.emps[#self.emps + 1] = stage
+    return true
+  end
   function h:status(id)
     if not self.alive[id] then return nil, 'vehicle_gone' end
     return F.copy(self.alive[id])

@@ -328,7 +328,16 @@ test('a CarKov hostile shows in red in the message box: inbound above the rest, 
   assert.equal(a.scope.notice({ carkov: { ...chasing.carkov, hold: { seconds: 3 } } }).kind, 'hold')
   assert.equal(a.scope.notice({ carkov: { active: true, hostile: { phase: 'disabled' } } }).title, 'HOSTILE DISABLED: CLAIM IT')
   const html = readFileSync(new URL('../mod/beamng_earth_enduro/ui/modules/apps/BeamNGEarthEnduroHUD/app.html', import.meta.url), 'utf8')
-  for (const phase of ['inbound', 'chasing', 'disabled']) assert.ok(html.includes(`data.carkov.hostile.phase === '${phase}'`), phase)
+  for (const phase of ['inbound', 'chasing', 'disabled', 'emp', 'fleeing']) assert.ok(html.includes(`data.carkov.hostile.phase === '${phase}'`), phase)
+})
+test('the hostile\'s EMP shows above a puncture, and a robber fleeing with the money shows what it took', () => {
+  const a = app()
+  const emp = { carkov: { active: true, hostile: { phase: 'emp', empSeconds: 5, stolen: 2500 } }, puncture: { flash: true } }
+  assert.equal(a.scope.notice(emp).kind, 'hostile')
+  assert.match(a.scope.notice(emp).title, /EMP! ENGINE DEAD 5/)
+  const fleeing = { carkov: { active: true, hostile: { phase: 'fleeing', stolen: 2500, distanceMetres: 80 } }, stateLabel: 'CARKOV' }
+  assert.equal(a.scope.notice(fleeing).title, 'ROBBED $2,500: CATCH IT')
+  assert.equal(a.scope.notice(fleeing).color, '#eb5757')
 })
 test('extraction counts down in the message box, then EXTRACTION COMPLETE stays until dismissed', () => {
   const a = app()

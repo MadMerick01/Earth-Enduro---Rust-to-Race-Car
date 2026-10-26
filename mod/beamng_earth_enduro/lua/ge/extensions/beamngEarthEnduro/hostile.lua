@@ -1,5 +1,6 @@
 -- CarKov hostile: once per run, at a random distance driven, a hostile car is spawned a few hundred
--- metres ahead of the player, facing them, and comes at them to ram them. Disabling it pays a bounty. The
+-- metres ahead of the player, facing them, and comes at them to ram them. Once it is close it can
+-- fire an EMP that stalls the player's car, rob them and flee. Disabling it pays a bounty. The
 -- core controller runs the encounter; this file holds its settings and the game calls that spawn,
 -- read and remove the hostile car. Every game call is guarded, so a missing or changed function
 -- makes the spawn fail and the run carries on without a hostile.
@@ -61,6 +62,29 @@ M.BRAIN = {
   STEER_SIGN = 1,
   DRIVE_EVERY_SECONDS = 0.2, -- how often its steering is updated while steered from here
 }
+-- The EMP, ported from Bolides The Cut (events/emp.lua and RobberEMP.lua). Once per encounter, once
+-- the hostile has rammed the player (or has chased them for AFTER_SECONDS without landing a hit),
+-- getting within METRES of them fires it: the player's engine cuts out and their brakes lock for
+-- SECONDS, with a shove away from the hostile for SHOCK_SECONDS. It takes ROB_SHARE of the player's
+-- money, at most ROB_MAX, pulls up for ROB_SECONDS and then flees with it. Disabling it pays the
+-- bounty and the money back. BeamNG.Earth only has ground within about 300 m of the player, so a
+-- fleeing hostile that gets ESCAPE_METRES away, or falls through the world, has got away with it.
+-- With nothing to take it just carries on ramming.
+M.EMP = {
+  METRES = 18,
+  AFTER_SECONDS = 30,
+  SECONDS = 6,
+  SHOCK_SECONDS = 0.5,
+  KICK_SPEED = 5, -- m/s added to the player's car, away from the hostile
+  -- The shove's repulsion (BeamNG's forceField planets), as tuned in Bolides: stronger with distance.
+  SHOCK_MASS = -3e13, SHOCK_RADIUS = 5, SHOCK_REFERENCE_METRES = 39,
+  ROB_SHARE = 0.25, ROB_MAX = 5000,
+  ROB_SECONDS = 4,
+  ESCAPE_METRES = 250,
+  FLEE_THROTTLE = 0.7,
+  FLEE_MAX_SPEED = 19.4, -- m/s (about 70 km/h): it lifts off above this, so it can be caught
+  SOUND = '/art/sound/beamngEarthEnduro/emp.wav',
+}
 -- The hostile's car: the Robber Light, a black off-road Roamer shipped in vehicles/roamer. Set
 -- both to nil to send a copy of the player's current car instead.
 M.MODEL, M.CONFIG = 'roamer', 'vehicles/roamer/robber_light.pc'
@@ -80,9 +104,10 @@ local function steerTowards(angle)
 end
 
 -- Straight at the player when far off, the chase AI when close, with a gap between the two so it
--- does not flip back and forth.
-local function approach(mode, reading)
+-- does not flip back and forth. After robbing them, away from them.
+local function approach(mode, reading, brain)
   local B = M.BRAIN
+  if brain and brain.fleeing then return 'flee' end
   if not reading.distance then return 'chase' end
   if mode == 'chase' then return reading.distance > B.DIRECT_BEYOND_METRES and 'direct' or 'chase' end
   return reading.distance > B.CHASE_WITHIN_METRES and 'direct' or 'chase'
@@ -94,6 +119,15 @@ local function order(mode, reading)
   local B = M.BRAIN
   if mode == 'chase' then return { kind = 'chase' } end
   if mode == 'beaten' then return { kind = 'rest' } end
+  if mode == 'rob' then return { kind = 'rest' } end
+  if mode == 'flee' then
+    -- Steers for the point straight behind it from the player; slower while turning round.
+    local away = reading.angle and (reading.angle > 0 and reading.angle - 180 or reading.angle + 180)
+    local turning = away and math.abs(away) > 90
+    local throttle = (reading.speed or 0) > M.EMP.FLEE_MAX_SPEED and 0
+      or turning and B.TURN_THROTTLE or M.EMP.FLEE_THROTTLE
+    return { kind = 'drive', gear = 1, throttle = throttle, steer = steerTowards(away) }
+  end
   local steer = steerTowards(reading.angle)
   if mode == 'direct' then
     local behind = reading.angle and math.abs(reading.angle) > 90
@@ -105,31 +139,37 @@ end
 
 -- One step of the brain. brain is a table kept between steps (start with {}); reading is the
 -- hostile's status: { speed, damage, distance, angle }. Returns the order to send, or nil when
--- nothing needs sending. brain.mode is 'direct', 'chase', 'unstick', 'backoff' or 'beaten'.
+-- nothing needs sending. brain.mode is 'direct', 'chase', 'unstick', 'backoff', 'beaten', 'rob'
+-- (pulled up after the EMP) or 'flee' (making off with the money).
 function M.think(brain, reading, dt)
   local B = M.BRAIN
   brain.timer = (brain.timer or 0) + dt
   brain.since = (brain.since or math.huge) + dt
   brain.tries = brain.tries or 0
+  brain.hunted = (brain.hunted or 0) + dt
   local hit = brain.lastDamage ~= nil and reading.damage - brain.lastDamage >= B.HIT_DAMAGE
   brain.lastDamage = reading.damage
   if reading.speed >= B.FREED_SPEED then brain.tries = 0 end
   brain.slow = reading.speed <= M.STILL_SPEED and (brain.slow or 0) + dt or 0
   local near = reading.distance ~= nil and reading.distance <= B.RAM_METRES
   local mode, nextMode = brain.mode, brain.mode
-  if mode == 'unstick' or mode == 'backoff' then
+  local fleeing = brain.fleeing
+  if hit and near and not fleeing then brain.hits = (brain.hits or 0) + 1 end
+  if mode == 'rob' then
+    if brain.timer >= M.EMP.ROB_SECONDS then nextMode = approach(nil, reading, brain) end
+  elseif mode == 'unstick' or mode == 'backoff' then
     local lasts = mode == 'unstick' and B.UNSTICK_SECONDS or B.BACKOFF_SECONDS
-    if brain.timer >= lasts then nextMode = approach(nil, reading) end
+    if brain.timer >= lasts then nextMode = approach(nil, reading, brain) end
   elseif mode ~= 'beaten' then
-    if hit and near then nextMode = 'backoff'
+    if hit and near and not fleeing then nextMode = 'backoff'
     elseif brain.slow >= B.STUCK_SECONDS then
       local allowed = reading.damage >= M.DISABLED_DAMAGE and B.UNSTICK_TRIES_DAMAGED or B.UNSTICK_TRIES
-      -- Stopped against the player is pushing, not stuck: back off and ram again.
-      if near then nextMode = 'backoff'
+      -- Stopped against the player is pushing, not stuck: back off and ram again. Fleeing, it is stuck.
+      if near and not fleeing then nextMode = 'backoff'
       elseif brain.tries < allowed then nextMode, brain.tries = 'unstick', brain.tries + 1
       else nextMode = 'beaten' end
     else
-      nextMode = approach(mode, reading)
+      nextMode = approach(mode, reading, brain)
     end
   end
   if nextMode ~= mode then
@@ -137,7 +177,7 @@ function M.think(brain, reading, dt)
     return order(nextMode, reading)
   end
   -- Steering from here needs updating as the player moves.
-  if (mode == 'direct' or mode == 'unstick' or mode == 'backoff') and brain.since >= B.DRIVE_EVERY_SECONDS then
+  if (mode == 'direct' or mode == 'unstick' or mode == 'backoff' or mode == 'flee') and brain.since >= B.DRIVE_EVERY_SECONDS then
     brain.since = 0
     return order(mode, reading)
   end
@@ -145,9 +185,33 @@ function M.think(brain, reading, dt)
 end
 
 -- Whether standing still now counts towards the hostile being disabled: not while it is
--- reversing out or backing off.
+-- reversing out, backing off or pulled up to rob the player.
 function M.counts(brain)
-  return brain.mode ~= 'unstick' and brain.mode ~= 'backoff'
+  return brain.mode ~= 'unstick' and brain.mode ~= 'backoff' and brain.mode ~= 'rob'
+end
+
+-- Whether the hostile fires its EMP now: once, close to the player, after ramming them (or chasing
+-- them long enough), and never while reversing out, backing off or beaten.
+function M.empReady(brain, reading)
+  local E = M.EMP
+  if brain.empFired or not reading.distance or reading.distance > E.METRES then return false end
+  local mode = brain.mode
+  if mode ~= 'direct' and mode ~= 'chase' then return false end
+  return (brain.hits or 0) > 0 or (brain.hunted or 0) >= E.AFTER_SECONDS
+end
+
+-- Whole dollars the EMP robbery takes from a balance.
+function M.robAmount(balance)
+  if type(balance) ~= 'number' or balance ~= balance or balance <= 0 then return 0 end
+  return math.floor(math.min(balance * M.EMP.ROB_SHARE, M.EMP.ROB_MAX))
+end
+
+-- The EMP has fired: the hostile pulls up for ROB_SECONDS, then flees if it took any money (or
+-- else goes back to ramming). Returns the order to send.
+function M.rob(brain, fleeing)
+  brain.empFired, brain.fleeing = true, fleeing and true or nil
+  brain.mode, brain.timer, brain.slow, brain.since = 'rob', 0, 0, 0
+  return { kind = 'rest' }
 end
 
 local function defaults()
@@ -242,6 +306,63 @@ function M.new(environment)
 
   -- Tells the hostile's AI to chase the player and ram them.
   function h:chase(id) return h:drive(id, { kind = 'chase' }) end
+
+  -- The EMP on the player's car, ported from Bolides The Cut (events/emp.lua). stage 'start' cuts
+  -- the ignition, locks the brakes, puts the hazards on, plays the EMP sound and shoves the car
+  -- away from hostile id; 'shock_over' ends the shove; 'over' gives the car back as it was. Nothing
+  -- in it breaks the car for good. Vehicle-side calls are best effort, each guarded, and not yet
+  -- checked in game in this mod.
+  local EMP_START = [[
+    _G.__earthEnduroEmp = _G.__earthEnduroEmp or {}
+    local s = _G.__earthEnduroEmp
+    pcall(function() s.warn, s.ignition = electrics.values.warn_signal, electrics.values.ignitionLevel end)
+    pcall(function() if not electrics.values.warn_signal then electrics.toggle_warn_signal() end end)
+    pcall(function() input.event("brake", 1, 1) input.event("throttle", 0, 1) end)
+    pcall(function() electrics.setIgnitionLevel(0) end)
+    pcall(function() obj:playSFXOnce(%q, 0, 1, 1) end)
+    pcall(function() thrusters.applyVelocity(vec3(%.4f, %.4f, %.4f)) end)
+    pcall(function() thrusters.applyVelocity(vec3(%.4f, %.4f, %.4f), 0.1) end)
+    pcall(function() thrusters.applyVelocity(vec3(%.4f, %.4f, %.4f), 0.3) end)
+    pcall(function() obj:setPlanets({%.4f, %.4f, %.4f, %d, %.6f}) end)
+  ]]
+  local EMP_SHOCK_OVER = 'pcall(function() obj:setPlanets({}) end)'
+  local EMP_OVER = [[
+    local s = _G.__earthEnduroEmp or {}
+    pcall(function() obj:setPlanets({}) end)
+    pcall(function() input.event("brake", 0, 1) end)
+    pcall(function() electrics.setIgnitionLevel(s.ignition or 2) end)
+    pcall(function() if s.warn ~= nil and electrics.values.warn_signal ~= s.warn then electrics.toggle_warn_signal() end end)
+    _G.__earthEnduroEmp = nil
+  ]]
+  function h:emp(id, stage)
+    local vehicle = player()
+    if not vehicle then return false, 'vehicle_required' end
+    local command
+    if stage == 'start' then
+      local objectsOK, objects = pcall(env.objects)
+      local source = objectsOK and type(objects) == 'table' and objects[id] or nil
+      local ok, pos, dir = pcall(function() return vehicle:getPosition(), vehicle:getDirectionVector() end)
+      if not ok or not pos then return false, 'position_unavailable' end
+      local E = M.EMP
+      local kx, ky, kz = dir and dir.x or 0, dir and dir.y or 1, 0
+      local sx, sy, sz = pos.x, pos.y, pos.z
+      if type(source) == 'table' and source.pos then
+        sx, sy, sz = source.pos.x, source.pos.y, source.pos.z
+        local d = length(pos.x - sx, pos.y - sy, pos.z - sz)
+        if d > 1e-3 then kx, ky, kz = (pos.x - sx) / d, (pos.y - sy) / d, (pos.z - sz) / d end
+      end
+      local k = length(kx, ky, kz)
+      if k < 1e-3 then kx, ky, kz, k = 0, 1, 0, 1 end
+      kx, ky, kz = kx / k * E.KICK_SPEED, ky / k * E.KICK_SPEED, kz / k * E.KICK_SPEED
+      local distance = length(pos.x - sx, pos.y - sy, pos.z - sz)
+      local mass = E.SHOCK_MASS * (distance / E.SHOCK_REFERENCE_METRES) ^ 2
+      command = string.format(EMP_START, E.SOUND, kx, ky, kz, kx, ky, kz, kx, ky, kz, sx, sy, sz, E.SHOCK_RADIUS, mass)
+    elseif stage == 'shock_over' then command = EMP_SHOCK_OVER
+    else command = EMP_OVER end
+    local sent, why = pcall(function() vehicle:queueLuaCommand(command) end)
+    if not sent then return false, 'emp_failed', tostring(why) end
+    return true
+  end
 
   -- Spawns the hostile aheadMetres ahead of the player vehicle and sideMetres to its right (negative:
   -- left), facing the player, and sets it chasing. config is a .pc path or a config table. Returns
